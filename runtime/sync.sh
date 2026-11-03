@@ -387,7 +387,12 @@ fi
 
 log "release $TAG: $STATE"
 push_tree
-info=$(runs_info) || die "cannot list the runs of $WORKFLOW: $(tail -n 1 "$SCRATCH/err")"
+# GitHub registers a freshly pushed workflow a few seconds late (404 until then)
+for i in $(seq 1 12); do
+  info=$(runs_info) && break
+  [ "$i" = 12 ] && die "cannot list the runs of $WORKFLOW: $(tail -n 1 "$SCRATCH/err")"
+  sleep 5
+done
 read -r ACTIVE BEFORE <<< "$info"
 if [ "${ACTIVE:--}" != "-" ]; then
   log "run $ACTIVE for $TAG is already going, not dispatching again"
