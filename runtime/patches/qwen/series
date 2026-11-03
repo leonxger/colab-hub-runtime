@@ -1,0 +1,3 @@
+# applied in order to llama.cpp b12015 (a34de86) by build.sh; both are off unless DRAFT_VOCAB is set
+pr31037-mtp-head-trim.diff
+dflash2-head-trim.diff

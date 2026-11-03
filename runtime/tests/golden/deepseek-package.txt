@@ -1,0 +1,7 @@
+llama-deepseek-b11963p22-cu13.0.2-sm120a-0123456789ab.tar.gz
+bin/llama-server
+bin/llama-fit-params
+bin/libggml-cuda.so
+lib/libpin.so
+BUILDINFO.json
+LICENSE

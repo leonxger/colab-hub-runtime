@@ -1,0 +1,10 @@
+llama-qwen-b12015-cu13.0.2-sm80-sm120a-0123456789ab.tar.gz
+bin/llama-server
+bin/llama-fit-params
+bin/test-backend-ops
+bin/libggml-cuda.so
+py/convert_hf_to_gguf.py
+py/conversion/__init__.py
+py/gguf-py/gguf/__init__.py
+BUILDINFO.json
+LICENSE

@@ -1,0 +1,50 @@
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index fc1ad69..3bec863 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -4,6 +4,17 @@
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+ 
++#include <cstdlib>
++
++// rows of the LM head a DFlash2 draft scores (LLAMA_DFLASH_DRAFT_VOCAB, 0 = all); token ids are a prefix, lowest ids first
++static int64_t dflash2_draft_vocab() {
++    static const int64_t n = [] {
++        const char * env = getenv("LLAMA_DFLASH_DRAFT_VOCAB");
++        return env ? std::max<int64_t>(0, atoll(env)) : 0;
++    }();
++    return n;
++}
++
+ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+ 
+     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
+@@ -1158,6 +1169,14 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+         output_s = model_other->output_s;
+     }
+ 
++    // DFlash2 reads candidate ids from these logits inside the graph, so scoring a prefix of the vocabulary stays exact for verification
++    const int64_t n_vocab_head = output->ne[1];
++    const int64_t n_head_rows  = dflash2_draft_vocab();
++    if (model.dflash_selector_hidden && !model.d2t && !output_s && n_head_rows >= (int64_t) hparams.dflash_selector_top_k &&
++            n_head_rows < n_vocab_head && (!hdmd || hdmd->rot.find(output) == hdmd->rot.end())) {
++        output = ggml_view_2d(ctx0, output, output->ne[0], n_head_rows, output->nb[1], 0);
++    }
++
+     cur = build_lora_mm(output, cur, output_s);
+ 
+     // DFlash2 feeds these logits to the selector, so they need the target's output
+@@ -1198,6 +1217,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+ 
+     if (model.dflash_selector_hidden) {
+         build_dflash2_selector(*this, model, inp_tokens);
++        if (res->t_logits->ne[0] < n_vocab_head) {
++            // the ids outside the prefix get -inf, so a full-vocabulary logits read stays valid
++            ggml_tensor * tail = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab_head - res->t_logits->ne[0], res->t_logits->ne[1]), -INFINITY);
++            res->t_logits = ggml_concat(ctx0, res->t_logits, tail, 0);
++            ggml_build_forward_expand(gf, res->t_logits);
++        }
+     } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
+         build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
+     }

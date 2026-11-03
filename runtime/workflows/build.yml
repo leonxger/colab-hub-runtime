@@ -1,0 +1,155 @@
+name: runtime-build
+run-name: build ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, rt- plus the first 12 hex of the runtime/ tree hash
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: runtime-${{ inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TAG: ${{ inputs.tag }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag against the tree
+        run: |
+          [[ "$TAG" =~ ^rt-[0-9a-f]{12}$ ]] || { echo "bad tag '$TAG'" >&2; exit 1; }
+          tree=$(git rev-parse HEAD:runtime)
+          [ "${tree:0:12}" = "${TAG#rt-}" ] || { echo "tag $TAG does not match the runtime/ tree ${tree:0:12} of $GITHUB_SHA" >&2; exit 1; }
+      - name: Create the draft release if missing
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG exists"
+          else
+            gh release create "$TAG" --draft --latest=false --target "$GITHUB_SHA" --title "$TAG" --notes "Prebuilt llama.cpp runtimes of the runtime/ tree ${TAG#rt-}. Development build, never the latest release."
+          fi
+
+  build:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [qwen, deepseek]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag against the tree and read the pins
+        run: |
+          [[ "$TAG" =~ ^rt-[0-9a-f]{12}$ ]] || { echo "bad tag '$TAG'" >&2; exit 1; }
+          tree=$(git rev-parse HEAD:runtime)
+          [ "${tree:0:12}" = "${TAG#rt-}" ] || { echo "tag $TAG does not match the runtime/ tree ${tree:0:12} of $GITHUB_SHA" >&2; exit 1; }
+          echo "TREE12=${TAG#rt-}" >> "$GITHUB_ENV"
+          grep -E '^[A-Z0-9_]+=[^ ]*$' runtime/versions.env >> "$GITHUB_ENV"
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Pull the build image
+        run: |
+          ref="${CUDA_IMAGE%%:*}@${CUDA_IMAGE_DIGEST}"
+          for registry in docker.io nvcr.io; do
+            for attempt in 1 2 3; do
+              if docker pull "$registry/$ref"; then
+                echo "IMAGE=$registry/$ref" >> "$GITHUB_ENV"
+                exit 0
+              fi
+              sleep $((attempt * 20))
+            done
+          done
+          echo "could not pull $ref" >&2
+          exit 1
+      - name: Prepare the work directories
+        run: mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/ccache"
+      - name: Restore the ccache
+        id: ccache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ matrix.family }}-${{ hashFiles('runtime/versions.env', format('runtime/patches/{0}/**', matrix.family)) }}
+          restore-keys: |
+            ccache-${{ matrix.family }}-
+      - name: Build in the CUDA image
+        env:
+          FAMILY: ${{ matrix.family }}
+          CCACHE_MAXSIZE: 2G
+        run: |
+          docker run --rm -i \
+            -e FAMILY -e TREE12 -e CCACHE_MAXSIZE \
+            -e CCACHE_DIR=/ccache -e CCACHE_COMPRESS=1 -e JOBS=4 \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE/runtime:/src/runtime:ro" \
+            -v "$RUNNER_TEMP/work:/work" \
+            -v "$RUNNER_TEMP/ccache:/ccache" \
+            "$IMAGE" bash -s << 'INNER'
+          set -euo pipefail
+          trap 'ccache -s || true; chown -R "$HOST_UID:$HOST_GID" /work /ccache' EXIT
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends git python3 cmake ninja-build ccache build-essential libssl-dev ca-certificates
+          nvcc --version | tail -n 1
+          case "$FAMILY" in
+            qwen)
+              WORK=/work/cudart bash /src/runtime/build/cudart.sh
+              WORK=/work/qwen bash /src/runtime/build/qwen.sh ;;
+            deepseek)
+              WORK=/work/deepseek bash /src/runtime/build/deepseek.sh ;;
+          esac
+          INNER
+      - name: Save the ccache after a failed build
+        if: failure() && steps.ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ matrix.family }}-${{ hashFiles('runtime/versions.env', format('runtime/patches/{0}/**', matrix.family)) }}
+      - name: Check the packed files
+        run: |
+          for out in "$RUNNER_TEMP"/work/*/out; do
+            (cd "$out" && sha256sum -c -- ./*.sha256)
+          done
+          ls -l "$RUNNER_TEMP"/work/*/out
+      - name: Upload to the draft release
+        run: gh release upload "$TAG" "$RUNNER_TEMP"/work/*/out/* --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check the asset set
+        run: |
+          [[ "$TAG" =~ ^rt-[0-9a-f]{12}$ ]] || { echo "bad tag '$TAG'" >&2; exit 1; }
+          gh release view "$TAG" --json assets --jq '.assets[].name' | tee assets.txt
+          for prefix in llama-qwen- llama-deepseek- cudart-; do
+            for suffix in .tar.gz .tar.gz.sha256; do
+              n=$(grep -cE "^${prefix}.*-${TAG#rt-}${suffix//./\\.}\$" assets.txt || true)
+              [ "$n" = 1 ] || { echo "release $TAG has $n assets of the form ${prefix}*${suffix}, want 1" >&2; exit 1; }
+            done
+          done
+      - name: Publish without marking it latest
+        run: gh release edit "$TAG" --draft=false --latest=false
