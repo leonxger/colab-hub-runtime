@@ -21,3 +21,5 @@ patch_seqrm.py
 patch_align.py
 patch_dma.py
 patch_dmaalign.py
+patch_loadwait.py
+patch_streamprefill.py

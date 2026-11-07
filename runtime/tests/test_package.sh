@@ -72,5 +72,5 @@ for fam in qwen deepseek; do
 done
 grep -qx 'bin/test-backend-ops' "$GOLDEN/qwen-package.txt" && ok "qwen golden lists bin/test-backend-ops (P18)" || bad "qwen golden lacks bin/test-backend-ops"
 [ "$(head -1 "$GOLDEN/qwen-package.txt")" = "llama-qwen-b12015-cu13.0.2-sm80-sm120a-0123456789ab.tar.gz" ] && ok "qwen tarball name follows interface 7" || bad "qwen tarball name differs from interface 7"
-[ "$(head -1 "$GOLDEN/deepseek-package.txt")" = "llama-deepseek-b11963p22-cu13.0.2-sm120a-0123456789ab.tar.gz" ] && ok "deepseek tarball name follows interface 7" || bad "deepseek tarball name differs from interface 7"
+[ "$(head -1 "$GOLDEN/deepseek-package.txt")" = "llama-deepseek-b11963p24-cu13.0.2-sm120a-0123456789ab.tar.gz" ] && ok "deepseek tarball name follows interface 7" || bad "deepseek tarball name differs from interface 7"
 finish test_package.sh
