@@ -8,6 +8,11 @@ on:
         description: Release tag, rt- plus the first 12 hex of the runtime/ tree hash
         required: true
         type: string
+      families:
+        description: Families to build, comma separated (qwen, deepseek, voice); the others keep the pins of their own release
+        required: false
+        default: qwen,deepseek,voice
+        type: string
 
 permissions:
   contents: write
@@ -26,7 +31,26 @@ env:
   GH_REPO: ${{ github.repository }}
 
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      voice: ${{ steps.plan.outputs.voice }}
+      families: ${{ steps.plan.outputs.families }}
+    steps:
+      - id: plan
+        env:
+          FAMILIES: ${{ inputs.families }}
+        run: |
+          [[ "$FAMILIES" =~ ^(qwen|deepseek|voice)(,(qwen|deepseek|voice))*$ ]] || { echo "bad families '$FAMILIES'" >&2; exit 1; }
+          list=$(tr ',' '\n' <<< "$FAMILIES" | sort -u | paste -sd, -)
+          echo "families=$list" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"family\":[\"${list//,/\",\"}\"]}" >> "$GITHUB_OUTPUT"
+          if [[ ",$list," == *,voice,* ]]; then echo "voice=true" >> "$GITHUB_OUTPUT"; else echo "voice=false" >> "$GITHUB_OUTPUT"; fi
+
   release:
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -47,13 +71,12 @@ jobs:
           fi
 
   build:
-    needs: release
+    needs: [plan, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      matrix:
-        family: [qwen, deepseek]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -111,7 +134,7 @@ jobs:
           trap 'ccache -s || true; chown -R "$HOST_UID:$HOST_GID" /work /ccache' EXIT
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends git python3 cmake ninja-build ccache build-essential libssl-dev ca-certificates
+          apt-get install -y -qq --no-install-recommends git python3 cmake ninja-build ccache build-essential libssl-dev ca-certificates curl
           nvcc --version | tail -n 1
           case "$FAMILY" in
             qwen)
@@ -119,6 +142,8 @@ jobs:
               WORK=/work/qwen bash /src/runtime/build/qwen.sh ;;
             deepseek)
               WORK=/work/deepseek bash /src/runtime/build/deepseek.sh ;;
+            voice)
+              WORK=/work/voice bash /src/runtime/build/voice.sh ;;
           esac
           INNER
       - name: Save the ccache after a failed build
@@ -136,19 +161,78 @@ jobs:
       - name: Upload to the draft release
         run: gh release upload "$TAG" "$RUNNER_TEMP"/work/*/out/* --clobber
 
+  smoke:
+    needs: plan
+    if: needs.plan.outputs.voice == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the pins
+        run: grep -E '^[A-Z0-9_]+=[^ ]*$' runtime/versions.env >> "$GITHUB_ENV"
+      - name: Install the build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cmake ninja-build ccache build-essential git python3 curl ca-certificates
+      - name: Restore the ccache
+        id: ccache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-smoke-${{ hashFiles('runtime/versions.env', 'runtime/build/voice.sh') }}
+          restore-keys: |
+            ccache-smoke-
+      - name: Build audiocpp_server for the CPU
+        env:
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPRESS: 1
+          JOBS: 4
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          WORK="$RUNNER_TEMP/smoke" bash runtime/build/voice.sh --cpu-audiocpp
+      - name: Save the ccache after a failed build
+        if: failure() && steps.ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-smoke-${{ hashFiles('runtime/versions.env', 'runtime/build/voice.sh') }}
+      - name: Fetch the pinned GGUF
+        run: bash runtime/smoke/fetch_gguf.sh "$RUNNER_TEMP/voice.gguf"
+      - name: Run the voice smoke scripts
+        run: |
+          export AUDIOCPP_SERVER="$RUNNER_TEMP/smoke/build/audiocpp-cpu/bin/audiocpp_server" VOICE_GGUF="$RUNNER_TEMP/voice.gguf" AUDIOCPP_SRC="$RUNNER_TEMP/smoke/src/audiocpp"
+          shopt -s nullglob
+          scripts=(runtime/smoke/voice_*.sh)
+          [ "${#scripts[@]}" -gt 0 ] || { echo "no runtime/smoke/voice_*.sh" >&2; exit 1; }
+          for script in "${scripts[@]}"; do
+            echo "::group::$script"
+            SMOKE_TMP="$RUNNER_TEMP/smoke-run-$(basename "$script" .sh)" bash "$script"
+            echo "::endgroup::"
+          done
+
   publish:
-    needs: build
+    needs: [plan, build, smoke]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      FAMILIES: ${{ needs.plan.outputs.families }}
     steps:
       - name: Check the asset set
         run: |
           [[ "$TAG" =~ ^rt-[0-9a-f]{12}$ ]] || { echo "bad tag '$TAG'" >&2; exit 1; }
           gh release view "$TAG" --json assets --jq '.assets[].name' | tee assets.txt
-          for prefix in llama-qwen- llama-deepseek- cudart-; do
+          want=()
+          [[ ",$FAMILIES," != *,qwen,* ]] || want+=("llama-qwen-.*-${TAG#rt-}" "cudart-.*-${TAG#rt-}")
+          [[ ",$FAMILIES," != *,deepseek,* ]] || want+=("llama-deepseek-.*-${TAG#rt-}")
+          [[ ",$FAMILIES," != *,voice,* ]] || want+=("voice-${TAG#rt-}")
+          for stem in "${want[@]}"; do
             for suffix in .tar.gz .tar.gz.sha256; do
-              n=$(grep -cE "^${prefix}.*-${TAG#rt-}${suffix//./\\.}\$" assets.txt || true)
-              [ "$n" = 1 ] || { echo "release $TAG has $n assets of the form ${prefix}*${suffix}, want 1" >&2; exit 1; }
+              n=$(grep -cE "^${stem}${suffix//./\\.}\$" assets.txt || true)
+              [ "$n" = 1 ] || { echo "release $TAG has $n assets of the form ${stem}${suffix}, want 1" >&2; exit 1; }
             done
           done
       - name: Publish without marking it latest

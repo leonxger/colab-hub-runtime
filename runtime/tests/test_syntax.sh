@@ -2,10 +2,10 @@
 # bash -n on every script, Python syntax of every patch script, pin.c compiles, scripts are executable, no dashes in our own files, the dev repo name only in versions.env.
 . "$(dirname "$0")/lib.sh"
 
-for f in "$RT"/build/*.sh "$RT"/tests/*.sh; do
+for f in "$RT"/build/*.sh "$RT"/smoke/*.sh "$RT"/tests/*.sh; do
   bash -n "$f" 2> "$SCRATCH/err" && ok "bash -n ${f#"$RT"/}" || bad "bash -n ${f#"$RT"/}: $(head -2 "$SCRATCH/err" | tr '\n' ' ')"
 done
-for f in "$RT"/build/*.sh "$RT"/tests/run.sh "$RT"/tests/test_*.sh; do
+for f in "$RT"/build/*.sh "$RT"/smoke/*.sh "$RT"/tests/run.sh "$RT"/tests/test_*.sh; do
   [ -x "$f" ] && ok "executable ${f#"$RT"/}" || bad "not executable: ${f#"$RT"/}"
 done
 bad_py=""
@@ -17,7 +17,7 @@ else
   skip "gcc not installed, pin.c not syntax-checked"
 fi
 if command -v shellcheck > /dev/null; then
-  shellcheck -S warning "$RT"/build/*.sh > "$SCRATCH/sc.out" 2>&1 && ok "shellcheck build scripts" || bad "shellcheck: $(head -5 "$SCRATCH/sc.out" | tr '\n' ' ')"
+  shellcheck -S warning "$RT"/build/*.sh "$RT"/smoke/*.sh > "$SCRATCH/sc.out" 2>&1 && ok "shellcheck build scripts" || bad "shellcheck: $(head -5 "$SCRATCH/sc.out" | tr '\n' ' ')"
 else
   skip "shellcheck not installed, build scripts not linted"
 fi

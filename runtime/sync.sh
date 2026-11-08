@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pushes the runtime/ tree to the public dev repo, dispatches the CUDA build and pins the release in manifests/runtime.json: runtime/sync.sh [--create] [--dry-run] [--wait] [--verify] [--force]; --verify alone re-checks the pin.
+# Pushes the runtime/ tree to the public dev repo, dispatches the CUDA build and pins the release in manifests/runtime.json: runtime/sync.sh [--create] [--dry-run] [--wait] [--verify] [--force] [--only=FAMILIES]; --verify alone re-checks the pin.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=runtime/build/common.sh
@@ -12,27 +12,31 @@ AUTHOR_EMAIL=leonxger@users.noreply.github.com
 # L4 and H100 join after a decision adds 89-real and 90-real
 QWEN_GPUS="G4 A100"
 DS_GPUS="G4"
-FAMILIES="qwen deepseek"
+# the CUDA archs run on the L4 (sm_89) by binary compatibility of the sm_80 code
+VOICE_GPUS="G4 A100 L4"
+ALL_FAMILIES="qwen deepseek voice"
 
 log() { echo "sync: $*"; }
 warn() { echo "sync: $*" >&2; }
 die() { echo "sync: FAILED: $*" >&2; exit 1; }
 usage() {
   cat >&2 << 'EOF'
-usage: runtime/sync.sh [--create] [--dry-run] [--wait] [--verify] [--force]
+usage: runtime/sync.sh [--create] [--dry-run] [--wait] [--verify] [--force] [--only=FAMILIES]
   --create   make the public dev repo when it does not exist
   --dry-run  print the tag, the files to push and the dispatch command; write nothing anywhere
   --wait     watch the build run, then pin the release in manifests/runtime.json
   --verify   stream every pinned asset through sha256sum and compare (alone: check the existing pin)
   --force    build again although the release of this tree is already published
+  --only=L   build only these families (comma separated: qwen, deepseek, voice) and merge them into the existing pin; the others keep the pins of their own release
 env: SYNC_REMOTE_URL (git remote of the dev repo), SYNC_WAIT_S (cap of --wait, default 20400), COLAB_HUB_RUNTIME_BASE (base_url of the pin)
 EOF
   exit "${1:-2}"
 }
 
-CREATE=0 DRY=0 WAIT=0 VERIFY=0 FORCE=0
+CREATE=0 DRY=0 WAIT=0 VERIFY=0 FORCE=0 ONLY=""
 for a in "$@"; do
   case "$a" in
+    --only=*) ONLY=${a#--only=} ;;
     --create) CREATE=1 ;;
     --dry-run) DRY=1 ;;
     --wait) WAIT=1 ;;
@@ -42,6 +46,16 @@ for a in "$@"; do
     *) warn "unknown option $a"; usage 2 ;;
   esac
 done
+FAMS="" FULL=1
+if [ -n "$ONLY" ]; then
+  [[ "$ONLY" =~ ^(qwen|deepseek|voice)(,(qwen|deepseek|voice))*$ ]] || die "--only takes qwen, deepseek and voice, comma separated (got '$ONLY')"
+  for f in $ALL_FAMILIES; do [[ ",$ONLY," == *,$f,* ]] && FAMS="$FAMS $f"; done
+  FAMS=${FAMS# }
+else
+  FAMS=$ALL_FAMILIES
+fi
+[ "$FAMS" = "$ALL_FAMILIES" ] || FULL=0
+FAMS_CSV=${FAMS// /,}
 VERIFY_ONLY=0
 [ "$VERIFY" = 1 ] && [ "$CREATE$DRY$WAIT$FORCE" = 0000 ] && VERIFY_ONLY=1
 
@@ -162,9 +176,10 @@ PY
 }
 
 dispatch() {
-  local i
+  local i extra=()
+  [ "$FULL" = 1 ] || extra=(-f "families=$FAMS_CSV")
   for i in 1 2 3 4 5 6 7 8; do
-    gh_ workflow run "$WORKFLOW" -R "$REPO" --ref "$BRANCH" -f "tag=$TAG" 2> "$SCRATCH/err" && return 0
+    gh_ workflow run "$WORKFLOW" -R "$REPO" --ref "$BRANCH" -f "tag=$TAG" "${extra[@]}" 2> "$SCRATCH/err" && return 0
     warn "dispatch attempt $i failed: $(tail -n 1 "$SCRATCH/err")"
     sleep "${SYNC_RETRY_SLEEP:-5}"
   done
@@ -187,16 +202,20 @@ watch_run() {
   log "run $id succeeded"
 }
 
-# the expected tarball names of this tree, one per line: qwen, deepseek, cudart
-asset_names() {
-  TREE12=$TREE12 bash "$HERE/build/qwen.sh" --list-package | sed -n 1p
-  TREE12=$TREE12 bash "$HERE/build/deepseek.sh" --list-package | sed -n 1p
-  echo "cudart-$(rt_cuda_version)-x64-$TREE12.tar.gz"
+# the expected tarballs of this tree for the built families, one "family file" per line: qwen, deepseek, voice, then cudart (only the Qwen job packs it)
+asset_pairs() {
+  local f
+  for f in $FAMS; do
+    echo "$f $(TREE12=$TREE12 bash "$HERE/build/$f.sh" --list-package | sed -n 1p)"
+  done
+  case " $FAMS " in *" qwen "*) echo "cudart cudart-$(rt_cuda_version)-x64-$TREE12.tar.gz" ;; esac
 }
 
 # the CUDA architectures of a family as the CMake line names them, space separated
 archs_of() {
-  bash "$HERE/build/$1.sh" --print-cmake | grep -o 'CMAKE_CUDA_ARCHITECTURES=[^ ]*' | head -n 1 | cut -d= -f2 | tr -d '"' | tr ';' ' '
+  local arg=""
+  [ "$1" != voice ] || arg=audiocpp
+  bash "$HERE/build/$1.sh" --print-cmake $arg | grep -o 'CMAKE_CUDA_ARCHITECTURES=[^ ]*' | head -n 1 | cut -d= -f2 | tr -d '"' | tr ';' ' '
 }
 
 # validates FILE against manifests/runtime.schema.json with the checker of vm/lib/manifest.py
@@ -213,39 +232,55 @@ sys.exit(1 if errors else 0)
 PY
 }
 
-# writes manifests/runtime.json from the published release's asset sizes and .sha256 files
+# true when every built family's pin entry (cudart too with qwen) names TAG as its release
+pin_current() {
+  [ -f "$PIN" ] || return 1
+  python3 -I -B - "$PIN" "$TAG" "$FAMS" << 'PY' 2> /dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = sys.argv[3].split() + (["cudart"] if "qwen" in sys.argv[3].split() else [])
+for f in want:
+    b = d["builds"].get(f)
+    if b is None or b.get("tag", d["tag"]) != sys.argv[2]:
+        sys.exit(1)
+PY
+}
+
+# writes manifests/runtime.json from the published release's asset sizes and .sha256 files; a partial build is merged into the existing pin and keeps every other entry as it is
 write_pin() {
-  local rel="$SCRATCH/release.json" shadir="$SCRATCH/sha" names n out
+  local rel="$SCRATCH/release.json" shadir="$SCRATCH/sha" pairs n out
   gh_ release view "$TAG" -R "$REPO" --json isDraft,assets > "$rel" 2> "$SCRATCH/err" || die "cannot read release $TAG: $(tail -n 1 "$SCRATCH/err")"
   [ "$(py_get isDraft < "$rel")" = False ] || die "release $TAG is still a draft, so the build did not publish it"
   mkdir -p "$shadir"
-  mapfile -t names < <(asset_names)
-  [ "${#names[@]}" = 3 ] || die "expected three asset names, got ${#names[@]}"
-  for n in "${names[@]}"; do
+  pairs=$(asset_pairs) || die "cannot name the expected assets"
+  while read -r _ n; do
     [[ "$n" =~ ^[A-Za-z0-9._-]+\.tar\.gz$ ]] || die "odd asset name '$n'"
-  done
-  python3 -I -B - "$rel" "${names[@]}" << 'PY' || die "the release assets differ from the expected set"
+  done <<< "$pairs"
+  python3 -I -B - "$rel" "$pairs" << 'PY' || die "the release assets differ from the expected set"
 import json, sys
 assets = {a["name"]: a for a in json.load(open(sys.argv[1]))["assets"]}
-want = set(sys.argv[2:]) | {n + ".sha256" for n in sys.argv[2:]}
+names = [l.split(" ", 1)[1] for l in sys.argv[2].splitlines() if l]
+want = set(names) | {n + ".sha256" for n in names}
 missing, extra = sorted(want - set(assets)), sorted(set(assets) - want)
 bad = sorted(n for n, a in assets.items() if a.get("state", "uploaded") != "uploaded")
 if missing or extra or bad:
     sys.exit("sync: release assets: missing %s, unexpected %s, not uploaded %s" % (missing or "none", extra or "none", bad or "none"))
 PY
-  for n in "${names[@]}"; do
-    timeout "${SYNC_DOWNLOAD_TIMEOUT:-1800}" gh release download "$TAG" -R "$REPO" -p "$n.sha256" -O - > "$shadir/$n.sha256" 2> "$SCRATCH/err" || die "cannot read $n.sha256: $(tail -n 1 "$SCRATCH/err")"
-  done
+  while read -r _ n; do
+    timeout "${SYNC_DOWNLOAD_TIMEOUT:-1800}" gh release download "$TAG" -R "$REPO" -p "$n.sha256" -O - < /dev/null > "$shadir/$n.sha256" 2> "$SCRATCH/err" || die "cannot read $n.sha256: $(tail -n 1 "$SCRATCH/err")"
+  done <<< "$pairs"
   out="$SCRATCH/runtime.json"
-  RT_DIR="$HERE" SHA_DIR="$shadir" REL_JSON="$rel" OUT="$out" TAG="$TAG" TREE12="$TREE12" BASE_URL="$BASE_URL" \
+  RT_DIR="$HERE" SHA_DIR="$shadir" REL_JSON="$rel" OUT="$out" OLD_PIN="$PIN" TAG="$TAG" TREE12="$TREE12" BASE_URL="$BASE_URL" FAMS="$FAMS" FILES="$pairs" \
     CUDA_VERSION="$(rt_cuda_version)" QWEN_TAG="$QWEN_TAG" QWEN_COMMIT="$QWEN_COMMIT" DS_TAG="$DS_TAG" DS_COMMIT="$DS_COMMIT" \
-    QWEN_GPUS="$QWEN_GPUS" DS_GPUS="$DS_GPUS" QWEN_ARCHS="$(archs_of qwen)" DS_ARCHS="$(archs_of deepseek)" \
-    QWEN_FILE="${names[0]}" DS_FILE="${names[1]}" CUDART_FILE="${names[2]}" \
+    AUDIOCPP_TAG="$AUDIOCPP_TAG" AUDIOCPP_COMMIT="$AUDIOCPP_COMMIT" QWENTTS_COMMIT="$QWENTTS_COMMIT" NUM2WORDS_VERSION="$NUM2WORDS_VERSION" \
+    QWEN_GPUS="$QWEN_GPUS" DS_GPUS="$DS_GPUS" VOICE_GPUS="$VOICE_GPUS" QWEN_ARCHS="$(archs_of qwen)" DS_ARCHS="$(archs_of deepseek)" VOICE_ARCHS="$(archs_of voice)" \
     python3 -I -B - << 'PY' || die "cannot build the pin"
 import json, os, re, sys
 e = os.environ
 assets = {a["name"]: a for a in json.load(open(e["REL_JSON"]))["assets"]}
-files = {"qwen": e["QWEN_FILE"], "deepseek": e["DS_FILE"], "cudart": e["CUDART_FILE"]}
+files = dict(l.split(" ", 1) for l in e["FILES"].splitlines() if l)
+built = e["FAMS"].split()
+order = ["qwen", "deepseek", "voice", "cudart"]
 
 def sha_of(file):
     text = open(os.path.join(e["SHA_DIR"], file + ".sha256")).read()
@@ -264,16 +299,28 @@ def entry(family, **fields):
         sys.exit("%s does not end with the tree id %s" % (file, e["TREE12"]))
     return {**fields, "file": file, "size": assets[file]["size"], "sha256": sha_of(file)}
 
-doc = {
-    "schema": 1,
-    "base_url": e["BASE_URL"],
-    "tag": e["TAG"],
-    "builds": {
-        "qwen": entry("qwen", llama_tag=e["QWEN_TAG"], commit=e["QWEN_COMMIT"], patches=series("qwen"), cuda=e["CUDA_VERSION"], archs=e["QWEN_ARCHS"].split(), gpus=e["QWEN_GPUS"].split()),
-        "deepseek": entry("deepseek", llama_tag=e["DS_TAG"], commit=e["DS_COMMIT"], patches=series("deepseek"), cuda=e["CUDA_VERSION"], archs=e["DS_ARCHS"].split(), gpus=e["DS_GPUS"].split()),
-        "cudart": entry("cudart"),
-    },
-}
+new = {}
+if "qwen" in built:
+    new["qwen"] = entry("qwen", llama_tag=e["QWEN_TAG"], commit=e["QWEN_COMMIT"], patches=series("qwen"), cuda=e["CUDA_VERSION"], archs=e["QWEN_ARCHS"].split(), gpus=e["QWEN_GPUS"].split())
+    new["cudart"] = entry("cudart")
+if "deepseek" in built:
+    new["deepseek"] = entry("deepseek", llama_tag=e["DS_TAG"], commit=e["DS_COMMIT"], patches=series("deepseek"), cuda=e["CUDA_VERSION"], archs=e["DS_ARCHS"].split(), gpus=e["DS_GPUS"].split())
+if "voice" in built:
+    new["voice"] = entry("voice", audiocpp_tag=e["AUDIOCPP_TAG"], audiocpp_commit=e["AUDIOCPP_COMMIT"], qwentts_commit=e["QWENTTS_COMMIT"], num2words=e["NUM2WORDS_VERSION"], cuda=e["CUDA_VERSION"], archs=e["VOICE_ARCHS"].split(), gpus=e["VOICE_GPUS"].split())
+
+if set(built) == {"qwen", "deepseek", "voice"}:
+    doc = {"schema": 1, "base_url": e["BASE_URL"], "tag": e["TAG"], "builds": {}}
+else:
+    if not os.path.exists(e["OLD_PIN"]):
+        sys.exit("a partial build needs the existing pin to merge into; build every family once first")
+    doc = json.load(open(e["OLD_PIN"]))
+    if doc["base_url"] != e["BASE_URL"]:
+        sys.exit("the pin's base_url is %s, expected %s" % (doc["base_url"], e["BASE_URL"]))
+    for family, b in new.items():
+        if e["TAG"] != doc["tag"]:
+            new[family] = {"tag": e["TAG"], **b}
+builds = {**doc["builds"], **new}
+doc["builds"] = {k: builds[k] for k in order if k in builds}
 with open(e["OUT"], "w") as f:
     json.dump(doc, f, indent=2)
     f.write("\n")
@@ -288,9 +335,9 @@ PY
   fi
 }
 
-# re-checks the pin against the release: schema, published, sizes, an anonymous GET, and every asset streamed through sha256sum
+# re-checks the pin against its releases: schema, published, sizes, an anonymous GET, and every asset streamed through sha256sum
 verify_pin() {
-  local rows ptag pbase fam file size sha rel got
+  local rows ptag pbase fam btag file size sha rel got seen=" "
   need curl
   need sha256sum
   [ -f "$PIN" ] || die "$PIN does not exist; run runtime/sync.sh --wait first"
@@ -300,24 +347,27 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 print("pin", d["tag"], d["base_url"])
 for family, b in d["builds"].items():
-    print(family, b["file"], b["size"], b["sha256"])
+    print(family, b.get("tag", d["tag"]), b["file"], b["size"], b["sha256"])
 PY
   ) || die "cannot read $PIN"
   read -r _ ptag pbase <<< "$(sed -n 1p <<< "$rows")"
   [ "$pbase" = "$BASE_URL" ] || die "the pin's base_url is $pbase, expected $BASE_URL"
-  [ "$ptag" = "$TAG" ] || warn "the pin is for $ptag, HEAD's runtime/ tree is $TAG; verifying the pin"
-  rel="$SCRATCH/verify-release.json"
-  gh_ release view "$ptag" -R "$REPO" --json isDraft,assets > "$rel" 2> "$SCRATCH/err" || die "cannot read release $ptag: $(tail -n 1 "$SCRATCH/err")"
-  [ "$(py_get isDraft < "$rel")" = False ] || die "release $ptag is a draft"
-  while read -r fam file size sha <&3; do
+  grep -qE "^[a-z]+ $TAG " <<< "$rows" || warn "no pinned build comes from $TAG, HEAD's runtime/ tree; verifying the pin"
+  while read -r fam btag file size sha <&3; do
+    rel="$SCRATCH/verify-release-$btag.json"
+    if [[ "$seen" != *" $btag "* ]]; then
+      gh_ release view "$btag" -R "$REPO" --json isDraft,assets > "$rel" 2> "$SCRATCH/err" || die "cannot read release $btag: $(tail -n 1 "$SCRATCH/err")"
+      [ "$(py_get isDraft < "$rel")" = False ] || die "release $btag is a draft"
+      seen="$seen$btag "
+    fi
     python3 -I -B - "$rel" "$file" "$size" << 'PY' || die "release asset $file does not match the pin (size or the .sha256 asset)"
 import json, sys
 assets = {a["name"]: a for a in json.load(open(sys.argv[1]))["assets"]}
 name, size = sys.argv[2], int(sys.argv[3])
 sys.exit(0 if name in assets and name + ".sha256" in assets and assets[name]["size"] == size else 1)
 PY
-    curl -fsSL --proto '=https' --proto-redir '=https' --max-time 120 -r 0-0 -o /dev/null "$pbase/$ptag/$file" || die "anonymous GET of $pbase/$ptag/$file failed"
-    got=$(set -o pipefail; timeout "${SYNC_DOWNLOAD_TIMEOUT:-1800}" gh release download "$ptag" -R "$REPO" -p "$file" -O - | sha256sum | cut -d ' ' -f 1) || die "download of $file failed"
+    curl -fsSL --proto '=https' --proto-redir '=https' --max-time 120 -r 0-0 -o /dev/null "$pbase/$btag/$file" || die "anonymous GET of $pbase/$btag/$file failed"
+    got=$(set -o pipefail; timeout "${SYNC_DOWNLOAD_TIMEOUT:-1800}" gh release download "$btag" -R "$REPO" -p "$file" -O - | sha256sum | cut -d ' ' -f 1) || die "download of $file failed"
     if [ "$got" = "$sha" ]; then
       log "verify ok: $fam $file $size bytes sha256 ${sha:0:12}"
     else
@@ -335,7 +385,11 @@ print_plan() {
   log "dev repo $REPO (public, development only), branch $BRANCH, remote $REMOTE_URL"
   log "would push $n files, $bytes bytes in runtime/, as $AUTHOR_NAME <$AUTHOR_EMAIL>, no trailers:"
   files_to_push | sed 's/^/  /'
-  log "would run: gh workflow run $WORKFLOW -R $REPO --ref $BRANCH -f tag=$TAG"
+  if [ "$FULL" = 1 ]; then
+    log "would run: gh workflow run $WORKFLOW -R $REPO --ref $BRANCH -f tag=$TAG"
+  else
+    log "would run: gh workflow run $WORKFLOW -R $REPO --ref $BRANCH -f tag=$TAG -f families=$FAMS_CSV"
+  fi
 }
 
 if [ "$VERIFY_ONLY" = 1 ]; then
@@ -379,8 +433,7 @@ fi
 
 if [ "$STATE" = published ] && [ "$FORCE" = 0 ]; then
   log "release $TAG is already published, nothing to build (--force builds it again)"
-  pinned=$(python3 -I -B -c 'import json, sys; print(json.load(open(sys.argv[1]))["tag"])' "$PIN" 2> /dev/null || true)
-  if [ "$pinned" != "$TAG" ]; then write_pin; fi
+  if ! pin_current; then write_pin; fi
   if [ "$VERIFY" = 1 ]; then verify_pin; fi
   exit 0
 fi

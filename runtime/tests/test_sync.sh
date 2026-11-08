@@ -60,6 +60,7 @@ good = {
     "builds": {
         "qwen": {"llama_tag": "b12015", "commit": "a" * 40, "patches": ["x.diff"], "cuda": "13.0.2", "archs": ["80-real", "120a-real"], "gpus": ["G4", "A100"], "file": "llama-qwen-0123456789ab.tar.gz", "size": 5, "sha256": "b" * 64},
         "deepseek": {"llama_tag": "b11963", "commit": "c" * 40, "patches": ["y.py"], "cuda": "13.0.2", "archs": ["120a-real"], "gpus": ["G4"], "file": "llama-deepseek-0123456789ab.tar.gz", "size": 6, "sha256": "d" * 64},
+        "voice": {"audiocpp_tag": "v0.9.4", "audiocpp_commit": "f" * 40, "qwentts_commit": "1" * 40, "num2words": "0.5.14", "cuda": "13.0.2", "archs": ["80-real", "120a-real"], "gpus": ["G4", "A100", "L4"], "file": "voice-0123456789ab.tar.gz", "size": 8, "sha256": "2" * 64},
         "cudart": {"file": "cudart-0123456789ab.tar.gz", "size": 7, "sha256": "e" * 64},
     },
 }
@@ -96,12 +97,31 @@ mutate("file-path", lambda d: d["builds"]["qwen"].update(file="../x.tar.gz"))
 mutate("file-not-tar", lambda d: d["builds"]["cudart"].update(file="x.zip"))
 mutate("cudart-extra-field", lambda d: d["builds"]["cudart"].update(archs=["80-real"]))
 mutate("qwen-missing-gpus", lambda d: d["builds"]["qwen"].pop("gpus"))
+mutate("voice-sha-63", lambda d: d["builds"]["voice"].update(sha256="2" * 63))
+mutate("voice-no-qwentts-commit", lambda d: d["builds"]["voice"].pop("qwentts_commit"))
+mutate("voice-extra-field", lambda d: d["builds"]["voice"].update(patches=["x.diff"]))
+mutate("voice-audiocpp-tag-bare", lambda d: d["builds"]["voice"].update(audiocpp_tag="0.9.4"))
+mutate("voice-file-path", lambda d: d["builds"]["voice"].update(file="a/b.tar.gz"))
+mutate("voice-gpu-unknown", lambda d: d["builds"]["voice"].update(gpus=["V100"]))
+mutate("build-tag-not-hex", lambda d: d["builds"]["qwen"].update(tag="rt-nothex"))
+mutate("cudart-tag-short", lambda d: d["builds"]["cudart"].update(tag="rt-0123"))
+mutate("tag-int", lambda d: d["builds"]["voice"].update(tag=5))
+def positive(label, fn):
+    doc = copy.deepcopy(good)
+    fn(doc)
+    print("pos-" + label, "VALID" if not errors(doc) else "REJECTED " + "; ".join(errors(doc)))
+
+positive("voice-optional", lambda d: d["builds"].pop("voice"))
+positive("build-own-tag", lambda d: (d["builds"]["voice"].update(tag="rt-aaaaaaaaaaaa"), d["builds"]["qwen"].update(tag="rt-bbbbbbbbbbbb"), d["builds"]["cudart"].update(tag="rt-cccccccccccc")))
 PY
 schema_out=$(python3 -I -B "$SCRATCH/schema_check.py" "$APP" 2>&1)
 grep -q '^good VALID$' <<< "$schema_out" && ok "a well-formed pin validates against runtime.schema.json" || bad "good pin: $(head -n 3 <<< "$schema_out" | tr '\n' ' ')"
 while read -r label verdict; do
-  [ "$label" = good ] && continue
-  [ "$verdict" = rejected ] && ok "schema rejects $label" || bad "schema accepts $label"
+  case "$label" in
+    good) continue ;;
+    pos-*) [ "$verdict" = VALID ] && ok "schema accepts ${label#pos-}" || bad "schema rejects ${label#pos-}: $verdict" ;;
+    *) [ "$verdict" = rejected ] && ok "schema rejects $label" || bad "schema accepts $label" ;;
+  esac
 done <<< "$schema_out"
 
 # ---- the fakes ----
@@ -132,21 +152,24 @@ def fail(message, code=1):
     print(message, file=sys.stderr)
     sys.exit(code)
 
-def asset_names(tag):
+def asset_names(tag, families):
     env = dict(os.environ, TREE12=tag[3:])
     out = []
-    for family in ("qwen", "deepseek"):
+    for family in ("qwen", "deepseek", "voice"):
+        if family not in families:
+            continue
         text = subprocess.run(["bash", "%s/build/%s.sh" % (os.environ["FAKE_RT"], family), "--list-package"], env=env, capture_output=True, text=True, check=True).stdout
         out.append(text.splitlines()[0])
-    out.append("cudart-13.0.2-x64-%s.tar.gz" % tag[3:])
+    if "qwen" in families:
+        out.append("cudart-13.0.2-x64-%s.tar.gz" % tag[3:])
     return out
 
-def finish_build(tag, success):
+def finish_build(tag, success, families):
     releases = load("releases.json", {})
     rel = releases.setdefault(tag, {"isDraft": True, "assets": []})
     skip = os.environ.get("FAKE_SKIP_ASSET", "")
     os.makedirs(path("assets"), exist_ok=True)
-    for index, name in enumerate(asset_names(tag)):
+    for index, name in enumerate(asset_names(tag, families)):
         if not success and index > 0:
             continue
         if skip and name.startswith(skip):
@@ -182,7 +205,9 @@ elif cmd == ["workflow", "run"]:
     if left > 0:
         open(path("dispatch_fails"), "w").write(str(left - 1))
         fail("could not find any workflows named build.yml")
-    tag = args[args.index("-f") + 1].split("=", 1)[1]
+    fields = dict(a.split("=", 1) for i, a in enumerate(args) if i > 0 and args[i - 1] == "-f")
+    tag = fields["tag"]
+    families = fields.get("families", "qwen,deepseek,voice").split(",")
     git = ["git", "--git-dir=" + os.environ["FAKE_REMOTE"]]
     if subprocess.run(git + ["cat-file", "-e", "main:.github/workflows/build.yml"], capture_output=True).returncode != 0:
         fail("could not find any workflows named build.yml")
@@ -190,7 +215,7 @@ elif cmd == ["workflow", "run"]:
     if tree[:12] != tag[3:]:
         fail("tag %s does not match the pushed runtime/ tree %s" % (tag, tree[:12]))
     runs = load("runs.json", [])
-    runs.insert(0, {"databaseId": 1000 + len(runs), "displayTitle": "build " + tag, "status": "queued", "conclusion": ""})
+    runs.insert(0, {"databaseId": 1000 + len(runs), "displayTitle": "build " + tag, "status": "queued", "conclusion": "", "families": families})
     save("runs.json", runs)
 elif cmd == ["run", "list"]:
     print(json.dumps(load("runs.json", [])))
@@ -199,7 +224,7 @@ elif cmd == ["run", "watch"]:
     run = [r for r in runs if str(r["databaseId"]) == args[2]][0]
     if run["status"] != "completed":
         success = os.environ.get("FAKE_RUN_RESULT", "success") == "success"
-        finish_build(run["displayTitle"][len("build "):], success)
+        finish_build(run["displayTitle"][len("build "):], success, run.get("families", ["qwen", "deepseek", "voice"]))
         run["status"], run["conclusion"] = "completed", "success" if success else "failure"
         save("runs.json", runs)
     print("fake watch of run %s: %s" % (args[2], run["conclusion"]))
@@ -362,7 +387,19 @@ def series(family):
 eq("schema", pin["schema"], 1)
 eq("tag", pin["tag"], tag)
 eq("base_url", pin["base_url"], "https://github.com/%s/releases/download" % repo)
-eq("builds", sorted(pin["builds"]), ["cudart", "deepseek", "qwen"])
+eq("builds", list(pin["builds"]), ["qwen", "deepseek", "voice", "cudart"])
+for family, b in pin["builds"].items():
+    if "tag" in b:
+        errs.append(family + " has its own tag in a full build")
+v = pin["builds"]["voice"]
+eq("voice audiocpp_tag", v["audiocpp_tag"], env["AUDIOCPP_TAG"])
+eq("voice audiocpp_commit", v["audiocpp_commit"], env["AUDIOCPP_COMMIT"])
+eq("voice qwentts_commit", v["qwentts_commit"], env["QWENTTS_COMMIT"])
+eq("voice num2words", v["num2words"], env["NUM2WORDS_VERSION"])
+eq("voice cuda", v["cuda"], "13.0.2")
+eq("voice archs", v["archs"], ["80-real", "120a-real"])
+eq("voice gpus", v["gpus"], ["G4", "A100", "L4"])
+eq("voice file", v["file"], "voice-" + tag[3:] + ".tar.gz")
 for family, tg, cm, archs, gpus in (("qwen", env["QWEN_TAG"], env["QWEN_COMMIT"], ["80-real", "120a-real"], ["G4", "A100"]), ("deepseek", env["DS_TAG"], env["DS_COMMIT"], ["120a-real"], ["G4"])):
     b = pin["builds"][family]
     eq(family + " llama_tag", b["llama_tag"], tg)
@@ -383,12 +420,12 @@ print("\n".join(errs) or "OK")
 PY
 pin_out=$(python3 -I -B "$SCRATCH/pin_check.py" "$PIN" "$ST" "$SRC/runtime" "$TAG" "$REPO" 2>&1)
 [ "$pin_out" = OK ] && ok "runtime.json fields come from versions.env, the series, the sizes and the .sha256 files of the release" || bad "runtime.json content: $pin_out"
-for fam in qwen deepseek cudart; do
+for fam in qwen deepseek voice cudart; do
   file=$(python3 -I -B -c 'import json, sys; print(json.load(open(sys.argv[1]))["builds"][sys.argv[2]]["file"])' "$PIN" "$fam")
   log_is "verify streamed $fam through gh release download" "^release download $TAG -R $REPO -p $file -O -\$" 1
 done
 out_has "verify says passed" "verify passed for $TAG"
-log_is "verify probed each asset anonymously" '^curl .*-r 0-0' 3
+log_is "verify probed each asset anonymously" '^curl .*-r 0-0' 4
 [ "$(ls "$SCRATCH/tmp" | wc -l)" = 0 ] && ok "sync.sh left no scratch directory behind" || bad "scratch left: $(ls "$SCRATCH/tmp")"
 
 # ---- a published release ends early; --force builds again ----
@@ -496,5 +533,67 @@ run_sync --create --wait
 want_rc "release without the cudart asset" 1
 out_has "the missing asset is named" "missing ['cudart-"
 [ ! -e "$PIN" ] && ok "no pin for an incomplete release" || bad "pin for an incomplete release"
+
+# ---- a voice-only build merges into the pin and leaves every other entry as it was ----
+reset_world
+run_sync --create --wait
+want_rc "full build before the voice-only one" 0
+cp "$PIN" "$SCRATCH/pin.full"
+run_sync --wait --only=voice
+want_rc "--only=voice without a change of the tree (release already published)" 0
+out_has "it ends early on the published release" "already published"
+echo "voice only change" >> "$SRC/runtime/README.md"
+"${GIT[@]}" add runtime/README.md && "${GIT[@]}" commit -q -m "runtime change for the voice-only build"
+TAG2=rt-$("${GIT[@]}" rev-parse HEAD:runtime | cut -c1-12)
+[ "$TAG2" != "$TAG" ] && ok "the runtime change moved the tag" || bad "tag did not move"
+run_sync --dry-run --only=voice
+out_has "dry run names the families of the dispatch" "-f tag=$TAG2 -f families=voice"
+run_sync --wait --verify --only=voice
+want_rc "--only=voice after a runtime change" 0
+log_is "one dispatch with the families input" "^workflow run build.yml -R $REPO --ref main -f tag=$TAG2 -f families=voice\$" 1
+cat > "$SCRATCH/pin_merge.py" << 'PY'
+import json, sys
+old, new, tag, tag2 = json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[3], sys.argv[4]
+errs = []
+if new["tag"] != tag:
+    errs.append("top-level tag moved to " + new["tag"])
+for family in ("qwen", "deepseek", "cudart"):
+    if new["builds"][family] != old["builds"][family]:
+        errs.append(family + " entry changed")
+if list(new["builds"]) != ["qwen", "deepseek", "voice", "cudart"]:
+    errs.append("order " + str(list(new["builds"])))
+v = new["builds"]["voice"]
+if v.get("tag") != tag2 or v["file"] != "voice-%s.tar.gz" % tag2[3:]:
+    errs.append("voice entry has tag %r file %r" % (v.get("tag"), v["file"]))
+if v["sha256"] == old["builds"]["voice"]["sha256"]:
+    errs.append("voice entry kept the old sha256")
+print("\n".join(errs) or "OK")
+PY
+merge_out=$(python3 -I -B "$SCRATCH/pin_merge.py" "$SCRATCH/pin.full" "$PIN" "$TAG" "$TAG2" 2>&1)
+[ "$merge_out" = OK ] && ok "qwen, deepseek and cudart keep their entries byte for byte; voice has its own tag and file" || bad "merged pin: $merge_out"
+python3 -I -B "$SCRATCH/schema_check.py" "$APP" "$PIN" > "$SCRATCH/pin.out" 2>&1 && ok "the merged pin validates against runtime.schema.json" || bad "merged pin invalid: $(head -n 3 "$SCRATCH/pin.out" | tr '\n' ' ')"
+diff <(python3 -I -B -c 'import json, sys; d = json.load(open(sys.argv[1])); [d["builds"].pop(k) for k in ("voice",)]; print(json.dumps(d, indent=2))' "$SCRATCH/pin.full") <(python3 -I -B -c 'import json, sys; d = json.load(open(sys.argv[1])); [d["builds"].pop(k) for k in ("voice",)]; print(json.dumps(d, indent=2))' "$PIN") > /dev/null && ok "without the voice entry the pin is identical to the one before" || bad "the merge changed more than the voice entry"
+log_is "verify streamed the voice asset of the new release" "^release download $TAG2 -R $REPO -p voice-${TAG2#rt-}.tar.gz -O -\$" 1
+log_is "verify streamed the Qwen asset of the old release" "^release download $TAG -R $REPO -p llama-qwen-.* -O -\$" 2
+out_has "verify passes with builds of two releases" "verify passed"
+pin_sum=$(sha256sum "$PIN" | cut -c1-64)
+run_sync --wait --only=voice
+want_rc "a second --only=voice run" 0
+out_has "it ends early on the published release" "already published"
+log_is "no second dispatch" "^workflow run build.yml -R $REPO --ref main -f tag=$TAG2 " 1
+[ "$(sha256sum "$PIN" | cut -c1-64)" = "$pin_sum" ] && ok "the pin is untouched by the second run" || bad "pin changed"
+rm -f "$PIN"
+run_sync --wait --only=voice
+want_rc "--only=voice with a published release and no pin" 1
+out_has "a partial build needs the pin to merge into" "needs the existing pin"
+cp "$SCRATCH/pin.full" "$PIN"
+run_sync --only=voice
+want_rc "--only=voice heals a pin that lacks the new voice entry" 0
+python3 -I -B "$SCRATCH/pin_merge.py" "$SCRATCH/pin.full" "$PIN" "$TAG" "$TAG2" | grep -qx OK && ok "the healed pin has the voice entry of the new release and the old rest" || bad "healed pin wrong"
+run_sync --wait --only=bogus
+want_rc "--only with an unknown family" 1
+out_has "the refusal names the families" "--only takes qwen, deepseek and voice"
+run_sync --wait --only=
+want_rc "--only with an empty list" 1
 
 finish test_sync.sh

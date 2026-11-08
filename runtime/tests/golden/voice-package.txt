@@ -1,0 +1,13 @@
+voice-0123456789ab.tar.gz
+audiocpp/bin/audiocpp_server
+audiocpp/bin/libggml-cuda.so
+qwentts/bin/tts-server
+qwentts/bin/libggml-cuda.so
+py/num2words/__init__.py
+py/num2words/COPYING
+py/num2words/SOURCE.txt
+licenses/audio.cpp.LICENSE
+licenses/qwentts.cpp.LICENSE
+licenses/NOTICE.txt
+BUILDINFO.json
+LICENSE

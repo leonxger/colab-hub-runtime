@@ -16,6 +16,8 @@ The patches are derived from llama.cpp (MIT, `patches/*/LICENSE.llama.cpp`) and 
 | `build/qwen.sh`, `build/deepseek.sh` | one family each: CMake line, targets, tarball layout |
 | `build/check_elf.sh` | post-build checks on the staged tree |
 | `build/cudart.sh` | optional fallback asset with the CUDA 13 runtime libraries of the image |
+| `build/voice.sh` | the voice tarball: audio.cpp `audiocpp_server`, qwentts.cpp `tts-server`, vendored `num2words`; `--cpu-audiocpp` builds the CPU server of the smoke job |
+| `smoke/` | `fetch_gguf.sh` (pinned Qwen3-TTS GGUF, size and sha256 checked) and `voice_*.sh`, the scripts the CI smoke job runs in name order against the CPU `audiocpp_server` (env `AUDIOCPP_SERVER`, `VOICE_GGUF`, `AUDIOCPP_SRC`, `SMOKE_TMP`) |
 | `tests/` | `run.sh` runs every `test_*.sh`; `golden/` holds the expected CMake lines, package lists and the sha256 manifest of the copied files |
 
 ## Use
@@ -45,6 +47,7 @@ A build runs these steps and stops at the first failure: tool and `nvcc` release
 |---|---|
 | `llama-qwen-b12015-cu13.0.2-sm80-sm120a-<tree12>.tar.gz` | `bin/llama-server`, `bin/llama-fit-params`, `bin/test-backend-ops`, `bin/*.so` (backends are dynamic, CPU variants included), `py/` (`convert_hf_to_gguf.py`, `conversion/`, `gguf-py/gguf/`), `BUILDINFO.json`, `LICENSE` |
 | `llama-deepseek-b11963p24-cu13.0.2-sm120a-<tree12>.tar.gz` | `bin/llama-server`, `bin/llama-fit-params`, `bin/*.so`, `lib/libpin.so`, `BUILDINFO.json`, `LICENSE` |
+| `voice-<tree12>.tar.gz` | `audiocpp/bin/audiocpp_server` and `qwentts/bin/tts-server` with their own `lib*.so` each (RUNPATH `$ORIGIN`, two ggml versions never share a directory), `py/num2words/` (pure Python, `COPYING` LGPL-2.1, `SOURCE.txt`), `licenses/`, `BUILDINFO.json` (engine pins, GGUF pin), `LICENSE`; no CUDA runtime libraries (system CUDA or the cudart asset); sm_80 and sm_120a cubins, which also run on the L4 (sm_89) by binary compatibility |
 | `cudart-13.0.2-x64-<tree12>.tar.gz` | `lib/libcudart.so.13*`, `lib/libcublas.so.13*`, `lib/libcublasLt.so.13*`, `BUILDINFO.json`, `LICENSE` (the CUDA EULA when the image has it) |
 
 `<tree12>` is the first 12 hex characters of the `runtime/` tree hash. Binaries carry `RUNPATH $ORIGIN`. `BUILDINFO.json` has no timestamps: tag, commit, the sha256 of every patch, the CUDA image digest, the exact CMake line, the architectures and the targets. Packing is deterministic (sorted names, fixed owner and mtime, `gzip -n`), so equal build outputs give equal bytes.
@@ -69,3 +72,7 @@ The goldens in `tests/golden/*-cmake.txt` are what `--print-cmake` must print.
 Set `RT_SRC_QWEN` and `RT_SRC_DEEPSEEK` to patched clones (`common.sh --apply-only ...`) to also check every `-D` option name and target name of the two lines against the real trees, and to build a CPU-only static libllama of each tree and run `tests/loadwait_test.cpp` against it, and for DeepSeek `tests/streamprefill_test.cpp` (a fake GPU device, the prefill under random chunk arrival, then `vm/deepseek/checksizes.py` and `punch.py` on its fixture) (`test_loadwait.sh`: needs `cmake`, `ninja` and `g++`, about 2 min per tree at two jobs on a Raspberry Pi 5; `CMAKE` names another cmake).
 
 Only CI can show: the CUDA build itself, the cubin set and `ldd` of the real binaries, the GLIBC limit, and the `cuobjdump --list-elf` output format that `check_elf.sh` parses.
+
+## Voice runtime and partial builds
+
+`build.yml` takes a `families` input (default `qwen,deepseek,voice`), and `sync.sh --only=voice` dispatches just that family: the release holds only its asset and `sync.sh` merges the new entry into `manifests/runtime.json` with its own `tag`, so the Qwen and DeepSeek pins stay byte for byte (a family whose sources did not change keeps its older release). The smoke job (CPU build of `audiocpp_server`, pinned GGUF from `versions.env`, one German sentence as 24000 Hz WAV and as streamed PCM) must pass before the release is published; more smoke steps go in as `smoke/voice_*.sh`.
