@@ -3,7 +3,7 @@
 . "$(dirname "$0")/lib.sh"
 LAB=${LAB_REPO:-$HOME/colab-hub}
 # patches only this repo has; the lab comparison skips them and the series lines that name them
-OWN=(patch_loadwait.py patch_streamprefill.py)
+OWN=(patch_loadwait.py patch_streamprefill.py ckpt-per-request.diff)
 
 if (cd "$RT" && sha256sum --quiet -c "$GOLDEN/patches-sha256.txt" > "$SCRATCH/sum.out" 2>&1); then
   ok "all $(wc -l < "$GOLDEN/patches-sha256.txt") copied files match golden/patches-sha256.txt"
@@ -33,7 +33,7 @@ for fam in qwen deepseek; do
   [ -f "$d/LICENSE.llama.cpp" ] && ok "$fam: LICENSE.llama.cpp present" || bad "$fam: LICENSE.llama.cpp missing"
 done
 [ "$(grep -vc '^[[:space:]]*\(#\|$\)' "$RT/patches/deepseek/series")" = 24 ] && ok "deepseek series has 24 entries" || bad "deepseek series is not 24 entries"
-[ "$(grep -vc '^[[:space:]]*\(#\|$\)' "$RT/patches/qwen/series")" = 3 ] && ok "qwen series has 3 entries" || bad "qwen series is not 3 entries"
+[ "$(grep -vc '^[[:space:]]*\(#\|$\)' "$RT/patches/qwen/series")" = 4 ] && ok "qwen series has 4 entries" || bad "qwen series is not 4 entries"
 ! grep -rlq $'\r' "$RT/patches" "$RT/src" && ok "no CRLF in patches or pin.c" || bad "CRLF found in patches or pin.c"
 
 if [ ! -d "$LAB/vm/qwen27/patches" ] || [ ! -f "$LAB/vm/deepseek/pin.c" ]; then

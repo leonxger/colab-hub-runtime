@@ -1,0 +1,40 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 9377e3c..ec009c9 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4393,6 +4393,9 @@ private:
+                     // make checkpoints only for completion tasks
+                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+ 
++                    // per-request switch, so a latency-bound client can skip the checkpoints and their batch splits
++                    do_checkpoint = do_checkpoint && slot.task->params.checkpoints;
++
+                     // make a checkpoint of the parts of the memory that cannot be rolled back.
+                     // checkpoints are created only if:
+                     // - the model does not support partial sequence removal
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 0a14a96..5d08004 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -33,6 +33,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("cache_prompt", params.cache_prompt))
+         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
+ 
++    add((new field_bool("checkpoints", params.checkpoints))
++        ->set_desc("When false, no context checkpoints are created while this request's prompt is processed"));
++
+     add((new field_bool("return_tokens", params.return_tokens))
+         ->set_desc("Return the raw generated token ids in the `tokens` field"));
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 21b649a..307ae9e 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -78,6 +78,7 @@ struct task_params {
+     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+     bool return_tokens   = false;
+     bool return_progress = false;
++    bool checkpoints     = true; // false: this request makes no context checkpoints
+ 
+     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+ 

@@ -158,6 +158,15 @@ jobs:
             (cd "$out" && sha256sum -c -- ./*.sha256)
           done
           ls -l "$RUNNER_TEMP"/work/*/out
+      - name: Check that the Qwen tarball carries the patched server code
+        run: |
+          shopt -s nullglob
+          tars=("$RUNNER_TEMP"/work/qwen/out/llama-qwen-*.tar.gz)
+          [ "${#tars[@]}" -gt 0 ] || { echo "no Qwen tarball in this matrix leg"; exit 0; }
+          mkdir "$RUNNER_TEMP/qwen-check"
+          tar -xzf "${tars[0]}" -C "$RUNNER_TEMP/qwen-check" --wildcards 'bin/libllama-server-impl.so*' bin/llama-server
+          grep -qa 'no context checkpoints are created' "$RUNNER_TEMP"/qwen-check/bin/libllama-server-impl.so* "$RUNNER_TEMP/qwen-check/bin/llama-server" || { echo "the packed server code lacks the checkpoints field" >&2; exit 1; }
+          echo "the packed Qwen server code has the checkpoints field"
       - name: Upload to the draft release
         run: gh release upload "$TAG" "$RUNNER_TEMP"/work/*/out/* --clobber
 
@@ -213,9 +222,54 @@ jobs:
             echo "::endgroup::"
           done
 
+  smoke-qwen:
+    needs: plan
+    if: contains(needs.plan.outputs.families, 'qwen')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the pins
+        run: grep -E '^[A-Z0-9_]+=[^ ]*$' runtime/versions.env >> "$GITHUB_ENV"
+      - name: Install the build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cmake ninja-build ccache build-essential git python3 curl ca-certificates
+      - name: Restore the ccache
+        id: ccache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-smoke-qwen-${{ hashFiles('runtime/versions.env', 'runtime/build/qwen_smoke.sh', 'runtime/patches/qwen/**') }}
+          restore-keys: |
+            ccache-smoke-qwen-
+      - name: Build the CPU llama-server from the patched tree
+        env:
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPRESS: 1
+          JOBS: 4
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          WORK="$RUNNER_TEMP/smoke-qwen" bash runtime/build/qwen_smoke.sh
+      - name: Save the ccache after a failed build
+        if: failure() && steps.ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-smoke-qwen-${{ hashFiles('runtime/versions.env', 'runtime/build/qwen_smoke.sh', 'runtime/patches/qwen/**') }}
+      - name: Fetch the pinned hybrid GGUF
+        run: bash runtime/smoke/fetch_gguf.sh "$RUNNER_TEMP/qwen-smoke.gguf" QWEN_SMOKE
+      - name: Run the checkpoint smoke
+        run: |
+          export LLAMA_SERVER="$RUNNER_TEMP/smoke-qwen/build/bin/llama-server" QWEN_SMOKE_GGUF="$RUNNER_TEMP/qwen-smoke.gguf"
+          SMOKE_TMP="$RUNNER_TEMP/smoke-run-qwen_checkpoints" bash runtime/smoke/qwen_checkpoints.sh
+
   publish:
-    needs: [plan, build, smoke]
-    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped') }}
+    needs: [plan, build, smoke, smoke-qwen]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped') && (needs.smoke-qwen.result == 'success' || needs.smoke-qwen.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:

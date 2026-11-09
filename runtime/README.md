@@ -9,7 +9,7 @@ The patches are derived from llama.cpp (MIT, `patches/*/LICENSE.llama.cpp`) and 
 | Path | What |
 |---|---|
 | `versions.env` | every pin: llama.cpp tags and commits, CUDA image and digest, CCCL, owner and name of the release repo |
-| `patches/qwen/` | `series` plus two env-gated draft-vocabulary trim diffs for b12015 (MTP and DFlash) and `patch_loadwait.py` (load while downloading, inert unless `LLAMA_LOAD_WAIT` is set) |
+| `patches/qwen/` | `series` plus two env-gated draft-vocabulary trim diffs for b12015 (MTP and DFlash), `patch_loadwait.py` (load while downloading, inert unless `LLAMA_LOAD_WAIT` is set) and `ckpt-per-request.diff` (request field `"checkpoints": false` skips context checkpoints for that request, default true, inert for requests without it) |
 | `patches/deepseek/` | `series` plus 24 scripts (`apply_pr30966.py` applies `pr30966.diff`) for b11963, applied in order; the last two are this repo's own: `patch_loadwait.py`, inert unless `LLAMA_LOAD_WAIT` is set, and `patch_streamprefill.py` (the MoE prefill uploads each pinned expert once its chunks are verified, inert unless `LLAMA_MOE_STREAM_PREFILL=1`; `LLAMA_UPLOAD_LOG` gets one `uploaded` line per device copy of a mapped range) |
 | `src/pin.c` | `LD_PRELOAD` shim, built into `lib/libpin.so` of the DeepSeek tarball |
 | `build/common.sh` | clone at the tag, commit check, apply the series, packing helpers |
@@ -17,7 +17,8 @@ The patches are derived from llama.cpp (MIT, `patches/*/LICENSE.llama.cpp`) and 
 | `build/check_elf.sh` | post-build checks on the staged tree |
 | `build/cudart.sh` | optional fallback asset with the CUDA 13 runtime libraries of the image |
 | `build/voice.sh` | the voice tarball: audio.cpp `audiocpp_server`, qwentts.cpp `tts-server`, vendored `num2words`; `--cpu-audiocpp` builds the CPU server of the smoke job |
-| `smoke/` | `fetch_gguf.sh` (pinned Qwen3-TTS GGUF, size and sha256 checked) and `voice_*.sh`, the scripts the CI smoke job runs in name order against the CPU `audiocpp_server` (env `AUDIOCPP_SERVER`, `VOICE_GGUF`, `AUDIOCPP_SRC`, `SMOKE_TMP`) |
+| `build/qwen_smoke.sh` | the CPU `llama-server` of the Qwen checkpoint smoke, built from the patched b12015 tree |
+| `smoke/` | `fetch_gguf.sh` (pinned GGUF by prefix, `VOICE` or `QWEN_SMOKE`, size and sha256 checked), `qwen_checkpoints.sh` (hybrid Qwen3.5 0.8B GGUF: no checkpoint log line for a request with `"checkpoints": false`, one for a plain request; env `LLAMA_SERVER`, `QWEN_SMOKE_GGUF`, `SMOKE_TMP`) and `voice_*.sh`, the scripts the CI smoke job runs in name order against the CPU `audiocpp_server` (env `AUDIOCPP_SERVER`, `VOICE_GGUF`, `AUDIOCPP_SRC`, `SMOKE_TMP`) |
 | `tests/` | `run.sh` runs every `test_*.sh`; `golden/` holds the expected CMake lines, package lists and the sha256 manifest of the copied files |
 
 ## Use
